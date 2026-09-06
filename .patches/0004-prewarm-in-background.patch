@@ -1,0 +1,91 @@
+--- a/app/services/metadata_addon.py
++++ b/app/services/metadata_addon.py
+@@ -52,6 +52,10 @@
+         self._semaphore = asyncio.Semaphore(8)
+         self._search_catalog_cache: dict[tuple[str, str], str] = {}
+         self._catalog_lookup_lock = asyncio.Lock()
++        # Holds references to in-flight pre-warm tasks so the loop's
++        # GC doesn't kill them before they finish. Tasks remove
++        # themselves via a done-callback when complete.
++        self._prewarm_tasks: set[asyncio.Task[None]] = set()
+ 
+     @property
+     def default_base_url(self) -> str | None:
+@@ -158,9 +162,16 @@
+         # ratings overlay. Pre-warming spreads the upstream calls across
+         # the catalog refresh window (gated by the existing semaphore at
+         # 8 concurrent), so by the time the client opens the catalog
+-        # every poster is a cache hit. Failures are silent — pre-warming
+-        # is best-effort and must never affect enrichment success.
+-        await self._prewarm_artwork(poster, background)
++        # every poster is a cache hit.
++        #
++        # Crucially, pre-warming is dispatched as a background task and
++        # NOT awaited here. The metadata client is in the hot path of
++        # /manifest.json (which triggers a catalog refresh on first
++        # request); blocking lookup() on poster proxy round-trips makes
++        # Nuvio's startup hang for tens of seconds. Failures are silent
++        # — pre-warming is best-effort and must never affect enrichment
++        # success or latency.
++        self._schedule_prewarm(poster, background)
+ 
+         return MetadataMatch(
+             id=match_id,
+@@ -331,24 +342,42 @@
+         background = self._ensure_url(meta.get("background") or meta.get("fanart"))
+         return poster, background
+ 
+-    async def _prewarm_artwork(self, *artwork_urls: str | None) -> None:
+-        """Issue GET requests against artwork URLs to populate any
+-        upstream proxy cache (e.g. AIOMetadata's poster proxy) before
+-        the Stremio client requests the asset.
+-
+-        Each URL is fetched concurrently — but gated by the same
+-        semaphore that limits regular metadata requests, so this stays
+-        well within the per-minute rate limits of the underlying
+-        rating-poster provider.
+-
+-        Errors of any kind are logged at debug level and otherwise
+-        suppressed. This routine MUST NOT raise.
++    def _schedule_prewarm(self, *artwork_urls: str | None) -> None:
++        """Fire off a background task that warms the given artwork URLs
++        on the metadata add-on's poster proxy, returning immediately.
++
++        Pre-warming is dispatched as a fire-and-forget asyncio task so
++        it never blocks the calling lookup. The task is gated by the
++        same semaphore as regular metadata requests, so concurrency
++        stays bounded even if many lookups schedule warmups in quick
++        succession.
++
++        If no event loop is running (e.g. a synchronous context that
++        somehow reached this client), the call is a silent no-op rather
++        than an error.
+         """
+ 
+-        tasks = [self._fetch_for_warmup(url) for url in artwork_urls if url]
+-        if not tasks:
++        urls = [url for url in artwork_urls if url]
++        if not urls:
++            return
++
++        try:
++            loop = asyncio.get_running_loop()
++        except RuntimeError:
+             return
+-        await asyncio.gather(*tasks, return_exceptions=True)
++
++        task = loop.create_task(self._run_prewarm(urls))
++        # Hold a reference so the task isn't garbage-collected mid-flight.
++        # discard() runs as the done-callback and removes the entry once
++        # the task finishes, so the set never grows unboundedly.
++        self._prewarm_tasks.add(task)
++        task.add_done_callback(self._prewarm_tasks.discard)
++
++    async def _run_prewarm(self, urls: list[str]) -> None:
++        await asyncio.gather(
++            *(self._fetch_for_warmup(url) for url in urls),
++            return_exceptions=True,
++        )
+ 
+     async def _fetch_for_warmup(self, url: str) -> None:
+         try:
