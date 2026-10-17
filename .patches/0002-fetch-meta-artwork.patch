@@ -1,0 +1,77 @@
+--- a/app/services/metadata_addon.py
++++ b/app/services/metadata_addon.py
+@@ -128,6 +128,21 @@
+         if not match_id:
+             return None
+ 
++        # Search endpoints commonly return lightweight posters (e.g. raw
++        # TMDB CDN URLs). Stremio's spec keeps search responses small for
++        # speed; the rich artwork (RPDB-wrapped posters with rating
++        # overlays, fanart-style backgrounds, etc.) lives behind
++        # /meta/{type}/{id}.json. Fetch it and prefer those values when
++        # available. Failures are silent: we keep whatever the search
++        # response provided.
++        meta_poster, meta_background = await self._fetch_meta_artwork(
++            effective_base, content_type, match_id
++        )
++        if meta_poster:
++            poster = meta_poster
++        if meta_background:
++            background = meta_background
++
+         return MetadataMatch(
+             id=match_id,
+             title=str(match.get("name") or normalized_title),
+@@ -251,6 +266,52 @@
+ 
+         return None
+ 
++    async def _fetch_meta_artwork(
++        self, base_url: str, content_type: str, item_id: str
++    ) -> tuple[str | None, str | None]:
++        """Fetch enriched artwork for a known ID via ``/meta/{type}/{id}.json``.
++
++        Stremio's catalog search endpoints commonly return lightweight
++        poster URLs (e.g. raw TMDB CDN images). The richer artwork —
++        RPDB-wrapped posters with rating overlays, Fanart.tv backgrounds,
++        language-aware logos, etc. — lives behind the meta endpoint, which
++        is what Stremio itself queries when rendering a detail page.
++
++        Returns a ``(poster, background)`` tuple. Either value may be
++        ``None``. All errors are swallowed and yield ``(None, None)`` so
++        the caller can fall back to the search-response artwork.
++        """
++
++        if not item_id:
++            return None, None
++
++        url = f"{base_url}/meta/{content_type}/{quote(item_id, safe='')}.json"
++        try:
++            async with self._semaphore:
++                response = await self._client.get(url)
++            response.raise_for_status()
++        except httpx.HTTPError as exc:
++            logger.debug(
++                "Meta lookup for %s on %s failed: %s",
++                item_id,
++                base_url,
++                exc,
++            )
++            return None, None
++
++        try:
++            payload = response.json()
++        except ValueError:
++            return None, None
++
++        meta = payload.get("meta") if isinstance(payload, dict) else None
++        if not isinstance(meta, dict):
++            return None, None
++
++        poster = self._ensure_url(meta.get("poster") or meta.get("thumbnail"))
++        background = self._ensure_url(meta.get("background") or meta.get("fanart"))
++        return poster, background
++
+     def _select_best_match(
+         self,
+         title: str,
