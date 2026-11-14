@@ -1,0 +1,73 @@
+--- a/app/services/metadata_addon.py
++++ b/app/services/metadata_addon.py
+@@ -36,6 +36,12 @@
+     # ``search.series`` instead, which we discover at runtime.
+     _DEFAULT_SEARCH_CATALOG_ID = "top"
+ 
++    # Time budget for warming a single poster/background URL. Rating-poster
++    # backends (RPDB, TOP) can take a few seconds on cold lookups, so we
++    # set this comfortably above the 5s upstream timeouts seen in
++    # AIOMetadata's poster proxy.
++    _PREWARM_TIMEOUT_SECONDS = 15.0
++
+     def __init__(
+         self,
+         http_client: httpx.AsyncClient,
+@@ -143,6 +149,19 @@
+         if meta_background:
+             background = meta_background
+ 
++        # Pre-warm the artwork URLs so the metadata add-on's poster proxy
++        # populates its cache before the Stremio client ever requests
++        # them. Rating-poster providers (RPDB, TOP, etc.) often impose
++        # per-minute rate limits and serve the upstream image only on
++        # cache miss; if the client renders a full lane in one burst,
++        # most requests time out and fall back to plain TMDB art with no
++        # ratings overlay. Pre-warming spreads the upstream calls across
++        # the catalog refresh window (gated by the existing semaphore at
++        # 8 concurrent), so by the time the client opens the catalog
++        # every poster is a cache hit. Failures are silent — pre-warming
++        # is best-effort and must never affect enrichment success.
++        await self._prewarm_artwork(poster, background)
++
+         return MetadataMatch(
+             id=match_id,
+             title=str(match.get("name") or normalized_title),
+@@ -312,6 +331,37 @@
+         background = self._ensure_url(meta.get("background") or meta.get("fanart"))
+         return poster, background
+ 
++    async def _prewarm_artwork(self, *artwork_urls: str | None) -> None:
++        """Issue GET requests against artwork URLs to populate any
++        upstream proxy cache (e.g. AIOMetadata's poster proxy) before
++        the Stremio client requests the asset.
++
++        Each URL is fetched concurrently — but gated by the same
++        semaphore that limits regular metadata requests, so this stays
++        well within the per-minute rate limits of the underlying
++        rating-poster provider.
++
++        Errors of any kind are logged at debug level and otherwise
++        suppressed. This routine MUST NOT raise.
++        """
++
++        tasks = [self._fetch_for_warmup(url) for url in artwork_urls if url]
++        if not tasks:
++            return
++        await asyncio.gather(*tasks, return_exceptions=True)
++
++    async def _fetch_for_warmup(self, url: str) -> None:
++        try:
++            async with self._semaphore:
++                response = await self._client.get(
++                    url, timeout=self._PREWARM_TIMEOUT_SECONDS
++                )
++                # Drain the body so the connection is returned cleanly to
++                # the pool. We don't care about the bytes themselves.
++                await response.aread()
++        except httpx.HTTPError as exc:
++            logger.debug("Pre-warm of %s failed: %s", url, exc)
++
+     def _select_best_match(
+         self,
+         title: str,
